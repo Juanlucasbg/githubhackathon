@@ -18,7 +18,7 @@ from ingest import run_ingestion_pipeline
 from database_setup import setup_weaviate_schema, get_weaviate_client
 from knowledge import build_cobol_knowledge_graph, query_dependencies, search_similar_code, explain_program
 from models import db, CobolProgram, AnalysisSession, ChatMessage, ProgramDependency
-from database import init_database, store_cobol_program, store_chat_message, update_session_status
+from database import init_database, store_cobol_program, store_chat_message, update_session_status, get_program_by_id, search_programs_by_text
 from llm_integration import llm_service
 from analytics_service import analytics_service
 
@@ -90,6 +90,110 @@ def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS and \
            not any(c in filename for c in ['..', '/', '\\'])
+
+def _extract_program_name(message):
+    """Extract program name from message using regex"""
+    import re
+    patterns = [
+        r'\b([A-Z][A-Z0-9\-]{2,})\b',
+        r'program\s+([A-Z0-9\-]+)',
+        r'called\s+([A-Z0-9\-]+)'
+    ]
+    
+    message_upper = message.upper()
+    for pattern in patterns:
+        matches = re.findall(pattern, message_upper)
+        if matches:
+            return matches[0]
+    return None
+
+def _handle_dependency_query(message):
+    """Handle dependency-related queries"""
+    program_name = _extract_program_name(message)
+    
+    if program_name:
+        program = get_program_by_id(program_name)
+        if program:
+            dependencies = program.get('dependencies', [])
+            if dependencies:
+                response = f"Program '{program_name}' depends on:\n"
+                for i, dep in enumerate(dependencies, 1):
+                    response += f"{i}. {dep}\n"
+            else:
+                response = f"Program '{program_name}' has no external dependencies."
+        else:
+            response = f"Program '{program_name}' not found in the database."
+    else:
+        response = "Please specify a program name to analyze dependencies."
+    
+    return response
+
+def _handle_similarity_query(message):
+    """Handle similarity search queries"""
+    programs = search_programs_by_text(message, limit=5)
+    
+    if programs:
+        response = "Found similar COBOL programs:\n\n"
+        for i, program in enumerate(programs, 1):
+            response += f"{i}. Program: {program.get('programId', 'Unknown')}\n"
+            response += f"   File: {program.get('fileName', 'Unknown')}\n"
+            response += f"   Complexity: {program.get('complexity', 'Unknown')}\n"
+            
+            deps = program.get('dependencies', [])
+            if deps:
+                response += f"   Dependencies: {', '.join(deps[:3])}"
+                if len(deps) > 3:
+                    response += f" (and {len(deps) - 3} more)"
+                response += "\n"
+            response += "\n"
+    else:
+        response = "No similar COBOL programs found for your query."
+    
+    return response
+
+def _handle_explanation_query(message):
+    """Handle program explanation queries"""
+    program_name = _extract_program_name(message)
+    
+    if program_name:
+        program = get_program_by_id(program_name)
+        if program:
+            response = f"COBOL Program Analysis: {program_name}\n\n"
+            response += f"File: {program.get('fileName', 'Unknown')}\n"
+            response += f"Complexity: {program.get('complexity', 'Unknown')}\n"
+            response += f"Lines of Code: {program.get('lineCount', 0)}\n\n"
+            
+            procedures = program.get('procedures', [])
+            if procedures:
+                response += "Procedures/Functions:\n"
+                for proc in procedures[:10]:
+                    if isinstance(proc, dict):
+                        response += f"- {proc.get('name', 'Unknown')}\n"
+                    else:
+                        response += f"- {proc}\n"
+                if len(procedures) > 10:
+                    response += f"... and {len(procedures) - 10} more procedures\n"
+                response += "\n"
+            
+            deps = program.get('dependencies', [])
+            if deps:
+                response += "Dependencies:\n"
+                for dep in deps:
+                    response += f"- {dep}\n"
+        else:
+            response = f"Program '{program_name}' not found in the database."
+    else:
+        programs = search_programs_by_text(message, limit=3)
+        if programs:
+            response = "Found programs related to your query:\n\n"
+            for i, program in enumerate(programs, 1):
+                response += f"{i}. {program.get('programId', program.get('fileName', 'Unknown'))}\n"
+                response += f"   Complexity: {program.get('complexity', 'Unknown')}\n"
+                response += f"   Lines: {program.get('lineCount', 0)}\n\n"
+        else:
+            response = "No programs found matching your query. Please upload and process COBOL files first."
+    
+    return response
 
 @app.route('/')
 def index():
@@ -248,17 +352,36 @@ def _process_chat_query(message):
 
 @app.route('/health')
 def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with enhanced database testing"""
     try:
         # Test database connection
         try:
             db.session.execute(db.text('SELECT 1'))
-            return jsonify({'status': 'healthy', 'database': 'connected'})
+            db_status = 'connected'
         except Exception as db_error:
             logger.error(f"Database connection failed: {str(db_error)}")
-            return jsonify({'status': 'unhealthy', 'database': 'disconnected'}), 503
+            db_status = 'disconnected'
+            
+        # Check external services
+        weaviate_client = get_weaviate_client()
+        weaviate_status = 'connected' if weaviate_client and weaviate_client.is_ready() else 'disconnected'
+        
+        status = {
+            'status': 'healthy' if db_status == 'connected' else 'unhealthy',
+            'database': db_status,
+            'weaviate': weaviate_status,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        return jsonify(status), 200 if status['status'] == 'healthy' else 503
+        
     except Exception as e:
-        return jsonify({'status': 'unhealthy', 'error': str(e)}), 503
+        logger.error(f"Health check failed: {str(e)}")
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 503
 
 @app.route('/analytics')
 def analytics_dashboard():
@@ -307,26 +430,35 @@ def get_llm_status():
 
 @app.route('/api/llm/configure', methods=['POST'])
 def configure_llm():
-    """Configure custom LLM endpoint"""
+    """Configure custom LLM endpoint with validation"""
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No configuration data provided'}), 400
+            
         endpoint = data.get('endpoint')
-        
-        if endpoint:
-            os.environ['CUSTOM_LLM_ENDPOINT'] = endpoint
-            if data.get('token'):
-                os.environ['CUSTOM_LLM_TOKEN'] = data.get('token')
-            
-            # Reinitialize LLM service
-            llm_service.initialize_provider()
-            
-            return jsonify({
-                'success': True,
-                'message': 'LLM endpoint configured successfully',
-                'provider': llm_service.current_provider
-            })
-        else:
+        if not endpoint:
             return jsonify({'error': 'Endpoint URL required'}), 400
+            
+        # Validate endpoint URL
+        from urllib.parse import urlparse
+        parsed_url = urlparse(endpoint)
+        if not all([parsed_url.scheme, parsed_url.netloc]):
+            return jsonify({'error': 'Invalid endpoint URL'}), 400
+        
+        # Configure LLM
+        os.environ['CUSTOM_LLM_ENDPOINT'] = endpoint
+        if data.get('token'):
+            os.environ['CUSTOM_LLM_TOKEN'] = data.get('token')
+        
+        # Reinitialize LLM service
+        llm_service.initialize_provider()
+        
+        return jsonify({
+            'success': True,
+            'message': 'LLM endpoint configured successfully',
+            'provider': llm_service.current_provider
+        })
             
     except Exception as e:
         logger.error(f"LLM configuration error: {str(e)}")
