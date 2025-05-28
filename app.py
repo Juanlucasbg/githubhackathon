@@ -59,9 +59,9 @@ app.config.update(
     MAX_CONTENT_LENGTH=MAX_CONTENT_LENGTH
 )
 
-# Ensure directories exist with proper permissions
+# Ensure directories exist
 for folder in [UPLOAD_FOLDER, TEMP_FOLDER]:
-    os.makedirs(folder, mode=0o755, exist_ok=True)
+    os.makedirs(folder, exist_ok=True)
 
 # Initialize database
 db.init_app(app)
@@ -217,8 +217,8 @@ def upload_file():
         filename = secure_filename(file.filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         
-        # Create temporary directory with secure permissions
-        temp_dir = tempfile.mkdtemp(dir=app.config['TEMP_FOLDER'], mode=0o700)
+        # Create temporary directory without chmod
+        temp_dir = tempfile.mkdtemp(dir=app.config['TEMP_FOLDER'])
         
         try:
             session_id = get_or_create_session()
